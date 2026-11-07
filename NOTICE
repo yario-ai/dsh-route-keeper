@@ -4,6 +4,12 @@ This product includes software developed for dsh-shift-router
 (https://github.com/green-dalii/dsh-shift-router), MIT License,
 Copyright (c) 2026 green-dalii and dsh-shift-router contributors.
 
+Provenance chain: `src/cooldown.ts` derives from dsh-shift-router's
+`src/failover.ts`, which dsh-shift-router documents as ported from
+pi-shift-router (https://github.com/green-dalii/pi-shift-router). Attribution is
+retained through the chain; no additional or different copyright/license is
+claimed beyond the MIT terms already reproduced below.
+
 Adapted portions:
 - `src/cooldown.ts` — adapted from `src/failover.ts` (bounded exponential
   cooldown and failure-signature detection). Tier-specific selection was

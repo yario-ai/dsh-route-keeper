@@ -1,7 +1,8 @@
 /**
  * dsh-route-keeper — bounded cooldown state machine.
  *
- * Adapted from `dsh-shift-router/src/failover.ts` (MIT).
+ * Adapted from `dsh-shift-router/src/failover.ts` (MIT), which is itself ported
+ * from pi-shift-router (https://github.com/green-dalii/pi-shift-router).
  * Copyright (c) 2026 green-dalii and dsh-shift-router contributors.
  *
  * Changes: removed tier-specific selection; added a `providerRetryAfterMs` floor;

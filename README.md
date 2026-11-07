@@ -10,6 +10,29 @@ retries for managed routes (prepended, so native `dsh-llm-retry` is never
 doubled), enforces host allowlist / role / data-flow boundaries, and optionally
 asks TypeSafe System One (Jev) for an advisory next-step route.
 
+## Installation
+
+Tested against DeepSeek Harness `0.2.2-rc.1` on Node `>=24`.
+
+- Desktop profiles are managed exclusively through the DSH bundle/plugin
+  manager in the GUI: add the reviewed `dsh-route-keeper-<version>.tgz` bundle
+  there, then enable it in the profile settings.
+- The isolated headless CLI is for tests only (never the desktop profile):
+
+  ```sh
+  dsh plugin --profile headless add ./dsh-route-keeper-<version>.tgz
+  ```
+
+- The plugin is **disabled by default** and does nothing until you set
+  `enabled: true` and explicitly list the role `allowHosts`.
+
+## Scope and profiles
+
+When enabled in a profile, the plugin covers every root and local child agent in
+all workspaces of that profile. Other profiles are unaffected. It never manages
+credentials, other apps, or cross-process dispatch; credentials are resolved only
+through the host credential reference (Jev's dedicated `TYPESAFE_API_KEY`).
+
 ## Features
 
 - Sticky primary with minimum residence; bounded cooldown and single-flight
@@ -65,8 +88,11 @@ asks TypeSafe System One (Jev) for an advisory next-step route.
     pin: null
 ```
 
-`enabled: false` plus empty `allowHosts` is a passive no-op. Disable/rollback
-without source changes: set `enabled: false` or remove the profile plugin row.
+`enabled: false` is a passive no-op. An empty `allowHosts` **denies** every
+automatic target select (fail-closed): route-keeper never treats an empty list
+as "allow all" — operators must list the exact providers they permit. Disable or
+roll back without source changes by setting `enabled: false` or removing the
+profile plugin row.
 
 ## Provider notes
 
