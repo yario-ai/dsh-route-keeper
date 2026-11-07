@@ -82,7 +82,7 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
   const activeTurnStep = new Map<string, { turn: number; step: number }>()
   const attemptCount = new Map<string, number>()
   const halfOpenRoutes = new Map<string, { route: Route; ownerSessionId: string }>()
-  const probeSnapshots = new Map<string, { routeKey: string; authorized: boolean; at: number }>()
+  const probeSnapshots = new Map<string, { routeKey: string; authorized: boolean; at: number; manualGeneration: number; configGeneration: number; registryRevision: number }>()
   /** Sessions that already recorded a `model/selection` before route-keeper admission. */
   const seenSelection = new Set<string>()
 
@@ -91,6 +91,8 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
   let lifetimeController = new AbortController()
   let disposed = false
   let wasEnabled = config.enabled === true
+  /** Bumped on `llm/adapters-updated` so cached async model metadata invalidates. */
+  let registryRevision = 0
 
   let policyHandle: SubagentPolicyHandle | undefined
   if (sessionProjections) {
@@ -110,6 +112,19 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     state.resident = route
     state.isFallback = isFallback
     state.residenceSince = Date.now()
+  }
+
+  /**
+   * Central synchronous final-admission guard. Called immediately before every
+   * selection side effect (after the LAST await) so a late manual/config change,
+   * cancel, disable or unmount can never be overwritten by a stale selection.
+   */
+  const finalAdmission = (state: RouteAgentState, agent: Agent, manualGeneration: number, configGeneration: number, signal: AbortSignal | undefined): boolean => {
+    if (!config.enabled || disposed || lifetimeController.signal.aborted) return false
+    if (signal?.aborted) return false
+    if (!agents?.get(agent.session.id)) return false
+    if (state.manualGeneration !== manualGeneration || state.configGeneration !== configGeneration) return false
+    return true
   }
 
   const assignManaged = (state: RouteAgentState, agent: Agent): void => {
@@ -207,8 +222,13 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
 
   /** Refresh the prevalidated fail-closed probe snapshot for a future boundary. */
   const refreshProbeSnapshot = async (state: RouteAgentState, route: Route): Promise<void> => {
+    const manualGeneration = state.manualGeneration
+    const configGeneration = state.configGeneration
+    const registryRev = registryRevision
     const authorized = await targetAuthorized(state, route, undefined)
-    probeSnapshots.set(state.sessionId, { routeKey: routeKey(route), authorized, at: Date.now() })
+    // Discard a snapshot whose guard inputs changed while the metadata resolved.
+    if (state.manualGeneration !== manualGeneration || state.configGeneration !== configGeneration) return
+    probeSnapshots.set(state.sessionId, { routeKey: routeKey(route), authorized, at: Date.now(), manualGeneration, configGeneration, registryRevision: registryRev })
   }
 
   const pickFallback = async (state: RouteAgentState, failed: Route, signal: AbortSignal | undefined): Promise<Route | undefined> => {
@@ -259,9 +279,12 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
 
     const rc = roleConfig(role)
     if (role === 'root') {
+      const manualGenBefore = state.manualGeneration
+      const configGenBefore = state.configGeneration
       if (config.pin) {
-        // Explicit global pin overrides a manual existing choice at this safe boundary.
         if (await targetAuthorized(state, config.pin, undefined)) {
+          // Final admission after the LAST await: no late manual/cancel/disable override.
+          if (!finalAdmission(state, agent, manualGenBefore, configGenBefore, undefined)) return undefined
           state.pin = { ...config.pin }
           state.configGeneration += 1
           selectOwned(state, agent, toModelSelection(config.pin))
@@ -271,6 +294,8 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
         const primary = resolvePrimary(rc)
         // Sticky primary applies only when no recorded manual selection pre-exists.
         if (primary && !seenSelection.has(agent.session.id) && await targetAuthorized(state, primary, undefined)) {
+          if (!finalAdmission(state, agent, manualGenBefore, configGenBefore, undefined)) return undefined
+          if (seenSelection.has(agent.session.id)) return undefined // manual select appeared during the metadata wait
           state.configGeneration += 1
           selectOwned(state, agent, toModelSelection(primary))
           setResident(state, primary, false)
@@ -441,20 +466,28 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
       if (state.halfOpen) return
       if (state.isFallback && state.primary && state.resident && !sameRoute(state.resident, state.primary)) {
         const primary = state.primary
-        if (Date.now() - state.residenceSince < config.sticky.minResidenceMs) return
+        const now = Date.now()
+        if (now - state.residenceSince < config.sticky.minResidenceMs) return
         const rk = routeKey(primary)
         if (halfOpenRoutes.has(rk)) return // route-wide contention
-        if (isModelInCooldown(state.cooldowns, primary, Date.now())) return
+        if (isModelInCooldown(state.cooldowns, primary, now)) return
         // Source protection: never probe away from a no-downgrade current route.
         if (state.resident && isNoDowngrade(roleConfig(state.role), state.resident)) return
-        // Prevalidated fail-closed snapshot only; stale ⇒ hold + refresh for the next boundary.
+        // Synchronous fail-closed re-validation of the live parts (egress/allowHosts/policy).
+        if (!isAllowedHost(config, state.role, primary.provider)) return
+        if (!llm || !llm.listProviders().some((p) => p.id === primary.provider)) return
+        if (!childTargetAllowed(state, primary)) return
+        // Async exact-model result must come from a current, non-stale snapshot.
         const snapshot = probeSnapshots.get(state.sessionId)
-        if (!snapshot || snapshot.routeKey !== rk || snapshot.at < state.residenceSince) {
+        if (!snapshot || snapshot.routeKey !== rk || snapshot.at < state.residenceSince
+          || snapshot.manualGeneration !== state.manualGeneration
+          || snapshot.configGeneration !== state.configGeneration
+          || snapshot.registryRevision !== registryRevision) {
           void refreshProbeSnapshot(state, primary)
           return
         }
         if (!snapshot.authorized) return
-        if (reserveHalfOpenRoute(state, primary, Date.now())) {
+        if (reserveHalfOpenRoute(state, primary, now)) {
           selectOwned(state, agent, toModelSelection(primary))
         }
       }
@@ -497,6 +530,7 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     const state = states.get(agent.session.id)
     if (!state) return
     resetFailureCounters(state)
+    state.fallbackHops = 0 // cross-route hop ceiling is per-episode, not lifetime
 
     if (state.isFallback && state.resident) clearModelCooldown(state.cooldowns, state.resident)
 
@@ -523,8 +557,10 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     if (!config.enabled || !config.jev.enabled || state.role !== 'root' || !state.currentTask) return
     if (signal?.aborted) return
     const rc = roleConfig('root')
-    // Protect the current source from downgrade and filter permitted targets.
+    // Protect the current source from downgrade; a manual pin and sticky residence win.
+    if (state.pin) return
     if (state.resident && isNoDowngrade(rc, state.resident)) return
+    if (Date.now() - state.residenceSince < config.sticky.minResidenceMs) return
     const genBefore = state.configGeneration
     const manualBefore = state.manualGeneration
     const allowed = [...(rc.primary ? [rc.primary] : []), ...rc.fallbacks]
@@ -539,12 +575,15 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     const outcome = await classifyWithJev(config.jev, state.currentTask, criteria, linked, {
       credentials: ctx.get('credentials') as never,
     })
-    // Lifetime revalidation: never select after cancel/disable/generation change.
+    // Lifetime revalidation before the second await.
     if (!config.enabled || !config.jev.enabled || linked.aborted || disposed) return
     if (genBefore !== state.configGeneration || manualBefore !== state.manualGeneration) return
     if (outcome.status === 'ok' && outcome.choice) {
       const target = allowed.find((r) => routeKey(r) === outcome.choice)
       if (target && await targetAuthorized(state, target, signal)) {
+        // Final admission after the LAST await + sticky residence re-check.
+        if (!finalAdmission(state, agent, manualBefore, genBefore, signal)) return
+        if (Date.now() - state.residenceSince < config.sticky.minResidenceMs) return
         state.resident = target
         state.isFallback = false
         state.residenceSince = Date.now()
@@ -564,12 +603,14 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
       const state = states.get(id)
       if (!state) return
       if (ownSelectSeq !== undefined && seq === ownSelectSeq) return // our own synchronous write
-      // External manual selection supersedes ownership and any pending latch.
+      // External manual selection supersedes ownership, probe and fallback state.
       state.manualGeneration += 1
       state.recoveryLatch = undefined
       state.ownedSelectionSeq = undefined
       state.ownedSelection = undefined
       state.predecessorSelection = undefined
+      state.isFallback = false // user took over: stop probing back
+      probeSnapshots.delete(id) // manual selection invalidates the probe snapshot
       if (state.halfOpen) releaseHalfOpenOwned(state)
       return
     }
@@ -584,6 +625,12 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
         state.predecessorSelection = undefined
       }
     }
+  })
+
+  // Provider/model registry changed: invalidate cached async metadata snapshots.
+  const disposeAdaptersUpdated = ctx.on('llm/adapters-updated', () => {
+    registryRevision += 1
+    probeSnapshots.clear()
   })
 
   // Inventory already-live agents at global install (safe attach, no switch).
@@ -613,7 +660,10 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
       clearRecoveryLatch(state)
       releaseHalfOpenOwned(state)
       const agent = agents?.get(id)
-      if (agent && config.enabled === false) restoreOwnedSelection(state, agent)
+      // Roll back on BOTH live disable and normal unmount/remount. The restore
+      // itself is seq-CAS: it only touches a still-owned, still-pending selection
+      // (never a newer manual choice or an already-used request header).
+      if (agent) restoreOwnedSelection(state, agent)
     }
     probeSnapshots.clear()
   }
@@ -639,6 +689,7 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     disposeInboxInserted()
     disposeStep()
     disposeSessionEvent()
+    disposeAdaptersUpdated()
     void policyHandle?.dispose().catch(() => {
       /* @silent-catch: projection unregister cleanup only; dispose is best-effort */
     })

@@ -414,7 +414,7 @@ describe('state-machine completeness', () => {
 
 describe('Jev integration lifetime guards', () => {
   it('dispose during Jev prevents a late select', async () => {
-    const jevCfg = { ...cfg, jev: { ...cfg.jev, enabled: true, timeoutMs: 60000 } }
+    const jevCfg = { ...cfg, sticky: { minResidenceMs: 0 }, jev: { ...cfg.jev, enabled: true, timeoutMs: 60000 } }
     const hanging = { resolve: () => new Promise<{ value?: string }>(() => {}) }
     const h = makeHarness(jevCfg, { credentials: hanging })
     await apply(h.ctx, jevCfg as any)
@@ -430,7 +430,7 @@ describe('Jev integration lifetime guards', () => {
   })
 
   it('oversize task is not truncated and produces no Jev select', async () => {
-    const jevCfg = { ...cfg, jev: { ...cfg.jev, enabled: true, maxPromptChars: 10 } }
+    const jevCfg = { ...cfg, sticky: { minResidenceMs: 0 }, jev: { ...cfg.jev, enabled: true, maxPromptChars: 10 } }
     const h = makeHarness(jevCfg, { credentials: { resolve: async () => ({ value: 'k' }) } })
     await apply(h.ctx, jevCfg as any)
     await h.fire('agent/created', { agent: h.agent, source: 'startup' })
@@ -440,7 +440,7 @@ describe('Jev integration lifetime guards', () => {
   })
 
   it('continuation notice / child delivery never overwrites or leaks the user task', async () => {
-    const jevCfg = { ...cfg, jev: { ...cfg.jev, enabled: true, maxPromptChars: 1000 } }
+    const jevCfg = { ...cfg, sticky: { minResidenceMs: 0 }, jev: { ...cfg.jev, enabled: true, maxPromptChars: 1000 } }
     const seenStates: string[] = []
     const fetchMock = vi.fn(async (_url: string, init: any) => {
       seenStates.push(JSON.parse(init.body).state)
@@ -465,6 +465,143 @@ describe('Jev integration lifetime guards', () => {
       expect(seenStates.join(' ')).not.toContain('provider switch')
     } finally {
       vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('correction cycle regressions (B1–B5)', () => {
+  it('B1 startup metadata await does not overwrite a concurrent manual select', async () => {
+    let release: ((v: any) => void) | undefined
+    const gate = new Promise<any>((res) => { release = res })
+    const h = makeHarness(cfg, {
+      resolveModelInfo: (p, m) => (m === 'gpt-6.1-sol' ? gate : { provider: p, id: m, name: m }),
+    })
+    await apply(h.ctx, cfg as any)
+    const created = h.fire('agent/created', { agent: h.agent, source: 'startup' })
+    h.fireExternalSelect({ provider: 'deepseek', model: 'deepseek-v4-pro' })
+    release!({ provider: 'openai-codex', id: 'gpt-6.1-sol', name: 'sol' })
+    await created
+    expect(h.agent.model.current()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' })
+    expect(h.calls).not.toContain(PRIMARY)
+  })
+
+  it('B1 Jev metadata await does not overwrite a concurrent manual select', async () => {
+    let releaseB: ((v: any) => void) | undefined
+    const gateB = new Promise<any>((res) => { releaseB = res })
+    const jevCfg = { ...cfg, sticky: { minResidenceMs: 0 }, jev: { ...cfg.jev, enabled: true } }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })))
+    try {
+      const h = makeHarness(jevCfg, {
+        credentials: { resolve: async () => ({ value: 'k' }) },
+        resolveModelInfo: (p, m) => (m === 'deepseek-v4.1-flash' ? gateB : { provider: p, id: m, name: m }),
+      })
+      await apply(h.ctx, jevCfg as any)
+      await h.fire('agent/created', { agent: h.agent, source: 'startup' })
+      await h.fire('agent/pre-step', { agent: h.agent, turn: 1, step: 1, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: 'task' }] }] }, () => ({ kind: 'enter', messages: [] }))
+      const tsPromise = h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      h.fireExternalSelect({ provider: 'deepseek', model: 'deepseek-v4-pro' })
+      releaseB!({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
+      await tsPromise
+      expect(h.agent.model.current()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' })
+      expect(h.calls).not.toContain(FALLBACK)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('B2 probe snapshot invalidated by manual select: no stale A restore over D', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = makeHarness(cfg)
+      await apply(h.ctx, cfg as any)
+      await startManagedFallback(h)
+      await Promise.resolve(); await Promise.resolve()
+      h.fireExternalSelect({ provider: 'deepseek', model: 'deepseek-v4-pro' })
+      vi.setSystemTime(Date.now() + 2000)
+      await h.fire('agent/status', { agent: h.agent, status: 'running' })
+      expect(h.calls.filter((c) => c === PRIMARY).length).toBe(1) // only the initial sticky primary
+      expect(h.agent.model.current()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('B2 probe snapshot re-validates live allowHosts (revoked A not selected)', async () => {
+    vi.useFakeTimers()
+    try {
+      const revokedCfg = { ...cfg, roles: { ...cfg.roles, root: { ...cfg.roles.root, allowHosts: ['openai-codex', 'opencode-go'] } } }
+      const h = makeHarness(revokedCfg)
+      await apply(h.ctx, revokedCfg as any)
+      await startManagedFallback(h)
+      await Promise.resolve(); await Promise.resolve()
+      // Revoke the primary provider after the async snapshot was cached.
+      revokedCfg.roles.root.allowHosts = ['opencode-go']
+      vi.setSystemTime(Date.now() + 2000)
+      await h.fire('agent/status', { agent: h.agent, status: 'running' })
+      expect(h.calls.filter((c) => c === PRIMARY).length).toBe(1) // only the initial sticky primary
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('B3 normal unmount (enabled still true) restores the owned pending selection', async () => {
+    const h = makeHarness(cfg)
+    await apply(h.ctx, cfg as any)
+    await startManagedFallback(h)
+    expect(h.agent.model.current()).toEqual({ provider: 'opencode-go', model: 'deepseek-v4.1-flash' })
+    h.dispose()
+    expect(h.agent.model.current()).toEqual({ provider: 'openai-codex', model: 'gpt-6.1-sol' })
+  })
+
+  it('B4 fallback hops reset per episode so a later probe failure can fall back again', async () => {
+    vi.useFakeTimers()
+    try {
+      const hopsCfg = { ...cfg, sticky: { minResidenceMs: 0 } }
+      const h = makeHarness(hopsCfg)
+      await apply(h.ctx, hopsCfg as any)
+      // Episode 1: A fails → fallback B.
+      await startManagedFallback(h)
+      await Promise.resolve(); await Promise.resolve() // flush probe snapshot refresh
+      await h.fire('agent/status', { agent: h.agent, status: 'idle' }) // commit latch → followup
+      await h.fire('agent/turn-stopping', { agent: h.agent, turn: 2, signal: new AbortController().signal }) // B succeeds → reset hops
+      // Advance past the primary cooldown so the return probe is admitted.
+      vi.setSystemTime(Date.now() + 70_000)
+      await h.fire('agent/status', { agent: h.agent, status: 'running' })
+      expect(h.calls.filter((c) => c === PRIMARY).length).toBe(2) // initial + probe return
+      await h.fire('agent/pre-step', { agent: h.agent, turn: 3, step: 1, messages: [] }, () => ({ kind: 'enter', messages: [] }))
+      const req: any = markAgentLoopRequest({ sessionId: 's1', provider: 'openai-codex', model: 'gpt-6.1-sol', signal: undefined } as any)
+      const stream = h.fire('llm/stream', req, async function* () { yield { type: 'finish', reason: { kind: 'error' } } as any })
+      for await (const _ of stream) { /* consume */ }
+      await h.fire('agent/request-error', { agent: h.agent, turn: 3, step: 1, provider: 'openai-codex', failure: { code: 'QUOTA', message: 'q' }, retryPolicy: undefined, signal: new AbortController().signal })
+      expect(h.calls.filter((c) => c === FALLBACK).length).toBe(2) // episode 1 + episode 2
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('B5 Jev advisory waits for an eligible residence boundary', async () => {
+    vi.useFakeTimers()
+    try {
+      const jevCfg = { ...cfg, sticky: { minResidenceMs: 3600000 }, jev: { ...cfg.jev, enabled: true } }
+      const seenStates: string[] = []
+      vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+        seenStates.push(JSON.parse(init.body).state)
+        return new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })
+      }))
+      const h = makeHarness(jevCfg, { credentials: { resolve: async () => ({ value: 'k' }) } })
+      await apply(h.ctx, jevCfg as any)
+      await h.fire('agent/created', { agent: h.agent, source: 'startup' })
+      const userMsg = { source: { kind: 'user' }, content: [{ type: 'text', text: 'task' }] }
+      await h.fire('agent/pre-step', { agent: h.agent, turn: 1, step: 1, messages: [userMsg] }, () => ({ kind: 'enter', messages: [] }))
+      await h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      expect(seenStates).toEqual([]) // hold: not yet eligible
+      expect(h.calls.filter((c) => c.startsWith('select:')).length).toBe(1)
+      vi.setSystemTime(Date.now() + 3600001)
+      await h.fire('agent/turn-stopping', { agent: h.agent, turn: 2, signal: new AbortController().signal })
+      expect(seenStates).toEqual(['task']) // now eligible
+    } finally {
+      vi.unstubAllGlobals()
+      vi.useRealTimers()
     }
   })
 })
