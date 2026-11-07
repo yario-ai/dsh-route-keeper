@@ -1,0 +1,16 @@
+dsh-route-keeper — third-party notices
+
+This product includes software developed for dsh-shift-router
+(https://github.com/green-dalii/dsh-shift-router), MIT License,
+Copyright (c) 2026 green-dalii and dsh-shift-router contributors.
+
+Adapted portions:
+- `src/cooldown.ts` — adapted from `src/failover.ts` (bounded exponential
+  cooldown and failure-signature detection). Tier-specific selection was
+  removed; a provider `Retry-After` floor was added.
+- `src/jev.ts` — the TypeSafe decision protocol (endpoint path, request body
+  shape, and response parsing) is grounded in `src/judge.ts` decision
+  request/parser parts. The orchestrate/noul question, CTO rubric/persona, and
+  raw error-body logging are omitted.
+
+The upstream license text is reproduced in LICENSE above.

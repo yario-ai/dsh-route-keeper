@@ -1,0 +1,6 @@
+node_modules/
+lib/
+.yario/
+*.log
+.DS_Store
+*.tgz

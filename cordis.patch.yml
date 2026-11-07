@@ -1,0 +1,7 @@
+# dsh-route-keeper — bundle patch layer
+#
+# Installed through `dsh plugin add ./dsh-route-keeper-0.1.0.tgz`, this patch
+# inserts the plugin row into any profile that lists the bundle.
+- insert:
+    - id: route-keeper
+      name: dsh-route-keeper
