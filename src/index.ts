@@ -116,15 +116,22 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
 
   /**
    * Central synchronous final-admission guard. Called immediately before every
-   * selection side effect (after the LAST await) so a late manual/config change,
-   * cancel, disable or unmount can never be overwritten by a stale selection.
+   * selection side effect (after the LAST await) so a late manual/config/input
+   * change, authority/registry change, cancel, disable, unmount, or replaced live
+   * agent can never be overwritten by a stale selection. No await follows it.
    */
-  const finalAdmission = (state: RouteAgentState, agent: Agent, manualGeneration: number, configGeneration: number, signal: AbortSignal | undefined): boolean => {
+  const admitTargetSelection = (
+    state: RouteAgentState, agent: Agent, target: Route,
+    manualGeneration: number, configGeneration: number, inputGeneration: number,
+    registryRev: number, signal: AbortSignal | undefined,
+  ): boolean => {
     if (!config.enabled || disposed || lifetimeController.signal.aborted) return false
     if (signal?.aborted) return false
-    if (!agents?.get(agent.session.id)) return false
+    if (agents?.get(agent.session.id) !== agent) return false // strict live identity
     if (state.manualGeneration !== manualGeneration || state.configGeneration !== configGeneration) return false
-    return true
+    if (state.inputGeneration !== inputGeneration) return false
+    if (registryRev !== registryRevision) return false
+    return targetSyncAuthorized(state, target)
   }
 
   const assignManaged = (state: RouteAgentState, agent: Agent): void => {
@@ -204,16 +211,19 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     return policy.some((r) => sameRoute(r, target))
   }
 
+  /** Synchronous live authority check (egress + allowHosts + durable parent policy). */
+  const targetSyncAuthorized = (state: RouteAgentState, target: Route): boolean => {
+    if (!isAllowedHost(config, state.role, target.provider)) return false
+    if (!llm || !llm.listProviders().some((p) => p.id === target.provider)) return false
+    if (!childTargetAllowed(state, target)) return false
+    return true
+  }
+
   /** Uniform authorization for every automatic target select (no-downgrade is source protection, not target). */
   const targetAuthorized = async (state: RouteAgentState, target: Route, signal: AbortSignal | undefined): Promise<boolean> => {
-    const rc = roleConfig(state.role)
-    if (!llm) return false
-    const providers = llm.listProviders()
-    if (!providers.some((p) => p.id === target.provider)) return false
-    if (!isAllowedHost(config, state.role, target.provider)) return false
-    if (!childTargetAllowed(state, target)) return false
+    if (!targetSyncAuthorized(state, target)) return false
     try {
-      await llm.resolveModelInfo(target.provider, target.model, signal)
+      await llm!.resolveModelInfo(target.provider, target.model, signal)
       return true
     } catch {
       return false
@@ -260,7 +270,7 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
   }
 
   // agent/created: register role, inventory, sticky primary/pin (fresh startup only, fully validated).
-  const disposeCreated = ctx.on('agent/created', async ({ agent, source }): Promise<undefined> => {
+  const disposeCreated = ctx.on('agent/created', async ({ agent, source, signal }): Promise<undefined> => {
     observeDisable()
     if (!config.enabled) return undefined
     const role = roleOf(agent)
@@ -281,10 +291,12 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     if (role === 'root') {
       const manualGenBefore = state.manualGeneration
       const configGenBefore = state.configGeneration
+      const inputGenBefore = state.inputGeneration
+      const registryRevBefore = registryRevision
       if (config.pin) {
-        if (await targetAuthorized(state, config.pin, undefined)) {
+        if (await targetAuthorized(state, config.pin, signal)) {
           // Final admission after the LAST await: no late manual/cancel/disable override.
-          if (!finalAdmission(state, agent, manualGenBefore, configGenBefore, undefined)) return undefined
+          if (!admitTargetSelection(state, agent, config.pin, manualGenBefore, configGenBefore, inputGenBefore, registryRevBefore, signal)) return undefined
           state.pin = { ...config.pin }
           state.configGeneration += 1
           selectOwned(state, agent, toModelSelection(config.pin))
@@ -293,8 +305,8 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
       } else {
         const primary = resolvePrimary(rc)
         // Sticky primary applies only when no recorded manual selection pre-exists.
-        if (primary && !seenSelection.has(agent.session.id) && await targetAuthorized(state, primary, undefined)) {
-          if (!finalAdmission(state, agent, manualGenBefore, configGenBefore, undefined)) return undefined
+        if (primary && !seenSelection.has(agent.session.id) && await targetAuthorized(state, primary, signal)) {
+          if (!admitTargetSelection(state, agent, primary, manualGenBefore, configGenBefore, inputGenBefore, registryRevBefore, signal)) return undefined
           if (seenSelection.has(agent.session.id)) return undefined // manual select appeared during the metadata wait
           state.configGeneration += 1
           selectOwned(state, agent, toModelSelection(primary))
@@ -427,15 +439,15 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
       if (state.fallbackHops >= config.budget.maxFallbackHops) return undefined
       const manualGenBefore = state.manualGeneration
       const configGenBefore = state.configGeneration
+      const inputGenBefore = state.inputGeneration
+      const registryRevBefore = registryRevision
       const retryAfter = (failure as LlmFailure).providerRetryAfterMs
       const target = await pickFallback(state, failed, signal)
-      // Post-await revalidation: signal/lifetime/enabled/manual+config generation/no newer input.
-      if (signal.aborted || lifetimeController.signal.aborted || disposed) return undefined
-      if (!config.enabled) return undefined
-      if (state.manualGeneration !== manualGenBefore || state.configGeneration !== configGenBefore) return undefined
-      if (state.recoveryLatch !== undefined) return undefined
-      if (agent.inbox.nextTurn.length > 0 || agent.inbox.nextStep.length > 0) return undefined
+      // Final admission after the LAST await: no stale selection after a late
+      // manual/config/input/authority/registry change, cancel, disable, unmount.
       if (!target) return undefined
+      if (!admitTargetSelection(state, agent, target, manualGenBefore, configGenBefore, inputGenBefore, registryRevBefore, signal)) return undefined
+      if (state.recoveryLatch !== undefined) return undefined
 
       recordTerminalFailure(state, now)
       markModelFailed(state.cooldowns, failed, now, retryAfter, { baseMs: config.cooldown.baseMs, maxMs: config.cooldown.maxMs })
@@ -513,12 +525,14 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     }
   })
 
-  // Genuine user input resets the auto-continue episode and drops a stale latch.
+  // Genuine user input bumps the input epoch, resets the auto-continue episode,
+  // and drops a stale latch.
   const disposeInboxInserted = ctx.on('agent/inbox/inserted', ({ agent, message }) => {
     observeDisable()
     const state = states.get(agent.session.id)
     if (!state) return
     if ((message as { source?: { kind?: string } }).source?.kind === 'user') {
+      state.inputGeneration += 1
       state.autoContinueCount = 0
       state.recoveryLatch = undefined
     }
@@ -563,6 +577,8 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
     if (Date.now() - state.residenceSince < config.sticky.minResidenceMs) return
     const genBefore = state.configGeneration
     const manualBefore = state.manualGeneration
+    const inputBefore = state.inputGeneration
+    const registryRevBefore = registryRevision
     const allowed = [...(rc.primary ? [rc.primary] : []), ...rc.fallbacks]
     const criteria: Record<string, string> = {}
     for (const r of allowed) {
@@ -582,7 +598,7 @@ export async function apply(ctx: Context, config: RouteKeeperConfig = {} as Rout
       const target = allowed.find((r) => routeKey(r) === outcome.choice)
       if (target && await targetAuthorized(state, target, signal)) {
         // Final admission after the LAST await + sticky residence re-check.
-        if (!finalAdmission(state, agent, manualBefore, genBefore, signal)) return
+        if (!admitTargetSelection(state, agent, target, manualBefore, genBefore, inputBefore, registryRevBefore, signal)) return
         if (Date.now() - state.residenceSince < config.sticky.minResidenceMs) return
         state.resident = target
         state.isFallback = false

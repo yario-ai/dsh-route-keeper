@@ -100,6 +100,8 @@ export interface RouteAgentState {
   manualGeneration: number
   /** Bumped on every plugin-applied config-driven selection (pin/primary). */
   configGeneration: number
+  /** Bumped on every genuine user input entering the inbox (turn or step). */
+  inputGeneration: number
   /** Terminal-failure accounting. */
   consecutiveFailures: number
   failureWindow: number[]

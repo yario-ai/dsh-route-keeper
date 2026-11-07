@@ -470,40 +470,160 @@ describe('Jev integration lifetime guards', () => {
 })
 
 describe('correction cycle regressions (B1–B5)', () => {
-  it('B1 startup metadata await does not overwrite a concurrent manual select', async () => {
-    let release: ((v: any) => void) | undefined
-    const gate = new Promise<any>((res) => { release = res })
+  function defer<T>() {
+    let release: ((v: T) => void) | undefined
+    let entered: (() => void) | undefined
+    const gate = new Promise<T>((res) => { release = res })
+    const enteredP = new Promise<void>((res) => { entered = res })
+    return { gate, release: release!, entered: () => entered!(), enteredP }
+  }
+
+  const jevCfgResident0 = { ...cfg, sticky: { minResidenceMs: 0 }, jev: { ...cfg.jev, enabled: true } }
+
+  it('B1a created signal cancellation aborts a pending startup select', async () => {
+    const d = defer<any>()
+    const ac = new AbortController()
     const h = makeHarness(cfg, {
-      resolveModelInfo: (p, m) => (m === 'gpt-6.1-sol' ? gate : { provider: p, id: m, name: m }),
+      resolveModelInfo: (p, m) => {
+        if (m === 'gpt-6.1-sol') { d.entered(); return d.gate }
+        return { provider: p, id: m, name: m }
+      },
+    })
+    await apply(h.ctx, cfg as any)
+    const created = h.fire('agent/created', { agent: h.agent, source: 'startup', signal: ac.signal })
+    await d.enteredP
+    ac.abort()
+    d.release({ provider: 'openai-codex', id: 'gpt-6.1-sol', name: 'sol' })
+    await created
+    expect(h.calls.filter((c) => c.startsWith('select:')).length).toBe(0)
+  })
+
+  it('B1 startup metadata await does not overwrite a concurrent manual select', async () => {
+    const d = defer<any>()
+    const h = makeHarness(cfg, {
+      resolveModelInfo: (p, m) => {
+        if (m === 'gpt-6.1-sol') { d.entered(); return d.gate }
+        return { provider: p, id: m, name: m }
+      },
     })
     await apply(h.ctx, cfg as any)
     const created = h.fire('agent/created', { agent: h.agent, source: 'startup' })
+    await d.enteredP
     h.fireExternalSelect({ provider: 'deepseek', model: 'deepseek-v4-pro' })
-    release!({ provider: 'openai-codex', id: 'gpt-6.1-sol', name: 'sol' })
+    d.release({ provider: 'openai-codex', id: 'gpt-6.1-sol', name: 'sol' })
     await created
     expect(h.agent.model.current()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' })
     expect(h.calls).not.toContain(PRIMARY)
   })
 
+  function jevMetadataAwait(opts: { resolveModelInfo: (p: string, m: string) => any; providers?: Array<{ id: string }>; cfgOver?: any }) {
+    const d = defer<any>()
+    const jevCfg = opts.cfgOver ?? jevCfgResident0
+    const h = makeHarness(jevCfg, {
+      providers: opts.providers,
+      credentials: { resolve: async () => ({ value: 'k' }) },
+      resolveModelInfo: (p: string, m: string) => {
+        if (m === 'deepseek-v4.1-flash') { d.entered(); return d.gate }
+        return opts.resolveModelInfo(p, m)
+      },
+    })
+    return { d, h }
+  }
+
+  async function setupJev(h: ReturnType<typeof makeHarness>, jevCfg: any) {
+    await apply(h.ctx, jevCfg as any)
+    await h.fire('agent/created', { agent: h.agent, source: 'startup' })
+    await h.fire('agent/pre-step', { agent: h.agent, turn: 1, step: 1, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: 'task' }] }] }, () => ({ kind: 'enter', messages: [] }))
+  }
+
   it('B1 Jev metadata await does not overwrite a concurrent manual select', async () => {
-    let releaseB: ((v: any) => void) | undefined
-    const gateB = new Promise<any>((res) => { releaseB = res })
-    const jevCfg = { ...cfg, sticky: { minResidenceMs: 0 }, jev: { ...cfg.jev, enabled: true } }
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })))
     try {
-      const h = makeHarness(jevCfg, {
-        credentials: { resolve: async () => ({ value: 'k' }) },
-        resolveModelInfo: (p, m) => (m === 'deepseek-v4.1-flash' ? gateB : { provider: p, id: m, name: m }),
-      })
-      await apply(h.ctx, jevCfg as any)
-      await h.fire('agent/created', { agent: h.agent, source: 'startup' })
-      await h.fire('agent/pre-step', { agent: h.agent, turn: 1, step: 1, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: 'task' }] }] }, () => ({ kind: 'enter', messages: [] }))
+      const { d, h } = jevMetadataAwait({ resolveModelInfo: (p, m) => ({ provider: p, id: m, name: m }) })
+      await setupJev(h, jevCfgResident0)
       const tsPromise = h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      await d.enteredP
       h.fireExternalSelect({ provider: 'deepseek', model: 'deepseek-v4-pro' })
-      releaseB!({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
+      d.release({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
       await tsPromise
       expect(h.agent.model.current()).toEqual({ provider: 'deepseek', model: 'deepseek-v4-pro' })
       expect(h.calls).not.toContain(FALLBACK)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('B1b new nextTurn user input during the Jev metadata await is not overwritten', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })))
+    try {
+      const { d, h } = jevMetadataAwait({ resolveModelInfo: (p, m) => ({ provider: p, id: m, name: m }) })
+      await setupJev(h, jevCfgResident0)
+      const tsPromise = h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      await d.enteredP
+      h.fire('agent/inbox/inserted', { agent: h.agent, message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'new task' }] } })
+      d.release({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
+      await tsPromise
+      expect(h.calls).not.toContain(FALLBACK)
+      expect(h.agent.model.current()).toEqual({ provider: 'openai-codex', model: 'gpt-6.1-sol' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('B1b new nextStep user input during the Jev metadata await is not overwritten', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })))
+    try {
+      const { d, h } = jevMetadataAwait({ resolveModelInfo: (p, m) => ({ provider: p, id: m, name: m }) })
+      await setupJev(h, jevCfgResident0)
+      const tsPromise = h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      await d.enteredP
+      h.fire('agent/inbox/inserted', { agent: h.agent, message: { source: { kind: 'user' }, content: [{ type: 'text', text: 'steer now' }] } })
+      d.release({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
+      await tsPromise
+      expect(h.calls).not.toContain(FALLBACK)
+      expect(h.agent.model.current()).toEqual({ provider: 'openai-codex', model: 'gpt-6.1-sol' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('B1c revoked allowHosts during the Jev metadata await blocks the select', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })))
+    try {
+      const revoked = {
+        ...cfg,
+        roles: { ...cfg.roles, root: { ...cfg.roles.root, allowHosts: ['openai-codex', 'opencode-go'] } },
+        sticky: { minResidenceMs: 0 },
+        jev: { ...cfg.jev, enabled: true },
+      }
+      const { d, h } = jevMetadataAwait({ resolveModelInfo: (p, m) => ({ provider: p, id: m, name: m }), cfgOver: revoked })
+      await setupJev(h, revoked)
+      const tsPromise = h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      await d.enteredP
+      revoked.roles.root.allowHosts = ['openai-codex'] // revoke B's provider
+      d.release({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
+      await tsPromise
+      expect(h.calls).not.toContain(FALLBACK)
+      expect(h.agent.model.current()).toEqual({ provider: 'openai-codex', model: 'gpt-6.1-sol' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('B1c provider removed + llm/adapters-updated during the Jev metadata await blocks the select', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ answers: { model: { choice: 'opencode-go/deepseek-v4.1-flash', confidence: 0.9 } } }), { status: 200 })))
+    try {
+      const providers = [{ id: 'openai-codex', name: 'codex' }, { id: 'opencode-go', name: 'go' }]
+      const { d, h } = jevMetadataAwait({ resolveModelInfo: (p, m) => ({ provider: p, id: m, name: m }), providers })
+      await setupJev(h, jevCfgResident0)
+      const tsPromise = h.fire('agent/turn-stopping', { agent: h.agent, turn: 1, signal: new AbortController().signal })
+      await d.enteredP
+      providers.splice(1, 1) // remove opencode-go
+      h.fire('llm/adapters-updated', undefined)
+      d.release({ provider: 'opencode-go', id: 'deepseek-v4.1-flash', name: 'flash' })
+      await tsPromise
+      expect(h.calls).not.toContain(FALLBACK)
+      expect(h.agent.model.current()).toEqual({ provider: 'openai-codex', model: 'gpt-6.1-sol' })
     } finally {
       vi.unstubAllGlobals()
     }

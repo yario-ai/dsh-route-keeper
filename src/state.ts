@@ -23,6 +23,7 @@ export function createAgentState(sessionId: string, role: Role): RouteAgentState
     predecessorSelection: undefined,
     manualGeneration: 0,
     configGeneration: 0,
+    inputGeneration: 0,
     consecutiveFailures: 0,
     failureWindow: [],
     firstFailureAt: undefined,
