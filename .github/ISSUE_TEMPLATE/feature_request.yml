@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a behaviour change or a new capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What fails, costs time, or is missing today? Describe the failure mode, not only the fix.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should route-keeper do instead? Include config changes if any.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Safety invariants
+      options:
+        - label: The proposal keeps route selection fail-closed
+        - label: The proposal adds no credential storage and no new network endpoint

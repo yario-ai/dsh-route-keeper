@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in dsh-route-keeper does not behave as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Redact API keys, tokens, account identifiers, and prompt/response bodies.
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DeepSeek Harness version
+      placeholder: 0.2.2-rc.1
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      placeholder: v24.x
+    validations:
+      required: true
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Profile type
+      options:
+        - Desktop (GUI bundle manager)
+        - Isolated headless CLI
+    validations:
+      required: true
+  - type: input
+    id: route
+    attributes:
+      label: Route involved
+      description: Primary and fallback provider/model
+      placeholder: openai-codex/gpt-6.1-sol -> opencode-go/deepseek-v4.1-flash
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: The route-keeper block of your profile config, with secrets removed
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Redacted excerpt around the failure
+      render: text

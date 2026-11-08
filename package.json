@@ -4,6 +4,14 @@
   "version": "0.1.0",
   "license": "MIT",
   "author": "yario-ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yario-ai/dsh-route-keeper.git"
+  },
+  "homepage": "https://github.com/yario-ai/dsh-route-keeper#readme",
+  "bugs": {
+    "url": "https://github.com/yario-ai/dsh-route-keeper/issues"
+  },
   "type": "module",
   "main": "lib/index.js",
   "exports": {

@@ -1,0 +1,81 @@
+{
+  "format": 1,
+  "title": {
+    "en": "yario-ai community plugins",
+    "ru": "Плагины yario-ai"
+  },
+  "description": {
+    "en": "Community plugins for DeepSeek Harness published by yario-ai.",
+    "ru": "Community-плагины для DeepSeek Harness от yario-ai."
+  },
+  "metadata": {
+    "categories": {
+      "routing": {
+        "title": {
+          "en": "Model routing",
+          "ru": "Маршрутизация моделей"
+        }
+      }
+    },
+    "labels": {
+      "mit": {
+        "title": {
+          "en": "MIT license",
+          "ru": "Лицензия MIT"
+        }
+      },
+      "community": {
+        "title": {
+          "en": "Community",
+          "ru": "Community"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-route-keeper",
+      "title": {
+        "en": "Route Keeper",
+        "ru": "Route Keeper"
+      },
+      "description": {
+        "en": "Keeps the root agent on a subscription primary model and falls back on allowed routes without losing the running turn.",
+        "ru": "Удерживает корневого агента на основной подписочной модели и переключает на разрешённые маршруты, не теряя текущий ход."
+      },
+      "author": "yario-ai",
+      "homepage": "https://github.com/yario-ai/dsh-route-keeper",
+      "repository": {
+        "url": "https://github.com/yario-ai/dsh-route-keeper"
+      },
+      "metadata": {
+        "category": "routing",
+        "keywords": [
+          "deepseek-harness",
+          "routing",
+          "fallback",
+          "retry",
+          "openai-codex",
+          "opencode-go",
+          "typesafe"
+        ],
+        "labels": [
+          "mit",
+          "community"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1794074662,
+          "source": {
+            "type": "npm"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.1"
+          }
+        }
+      ]
+    }
+  ]
+}
