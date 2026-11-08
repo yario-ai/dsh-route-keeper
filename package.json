@@ -1,7 +1,7 @@
 {
   "name": "dsh-route-keeper",
   "description": "Sticky model-route keeper for DeepSeek Harness: root/child sticky primary, bounded plugin-owned retry, cross-route fallback with same-activation auto-continue, host allowlist/role/egress enforcement, and optional bounded TypeSafe (Jev) advisory classification.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "author": "yario-ai",
   "repository": {
